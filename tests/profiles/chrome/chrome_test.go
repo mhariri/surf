@@ -1,6 +1,7 @@
 package chrome_test
 
 import (
+	"bytes"
 	"slices"
 	"strings"
 	"testing"
@@ -334,8 +335,21 @@ func TestHelloChrome152TrustAnchors(t *testing.T) {
 		if len(ext.Data) < 2 || int(ext.Data[0])<<8|int(ext.Data[1]) != len(ext.Data)-2 {
 			t.Errorf("%s: trust_anchors body length prefix does not match body (%d bytes)", name, len(ext.Data))
 		}
-		if len(ext.Data) != 206 {
-			t.Errorf("%s: trust_anchors body is %d bytes, Chrome 152 sends 206", name, len(ext.Data))
+		if len(ext.Data) != 186 {
+			t.Errorf("%s: trust_anchors body is %d bytes, Chrome 156 sends 186", name, len(ext.Data))
+		}
+		// Chrome sends the IDs in ascending byte order; Akamai denies an unsorted list.
+		var prev []byte
+		for rest := ext.Data[2:]; len(rest) > 0; {
+			n := int(rest[0])
+			if n == 0 || len(rest) < 1+n {
+				t.Fatalf("%s: malformed trust anchor ID at %d bytes from the end", name, len(rest))
+			}
+			id := rest[1 : 1+n]
+			if prev != nil && bytes.Compare(prev, id) >= 0 {
+				t.Errorf("%s: trust anchor IDs out of order: %x before %x", name, prev, id)
+			}
+			prev, rest = id, rest[1+n:]
 		}
 	}
 }
