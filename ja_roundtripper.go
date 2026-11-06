@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,7 +47,7 @@ func newRoundTripper(ja *JA, base http.RoundTripper) http.RoundTripper {
 
 	rt.http1tr.DialTLSContext = rt.dialTLS
 	rt.http1trFallback = http1tr.Clone()
-	rt.http1trFallback.DialTLSContext = rt.dialTLSHTTP1
+	rt.http1trFallback.DialTLSContext = rt.dialTLSFallback
 
 	if !ja.builder.forceHTTP1 {
 		rt.http2tr = rt.buildHTTP2Transport()
@@ -78,6 +79,11 @@ func (rt *roundtripper) handleHTTPSRequest(req *http.Request) (*http.Response, e
 	if rt.http2tr == nil {
 		return rt.http1tr.RoundTrip(req)
 	}
+
+	held := &heldConn{}
+	defer held.close()
+
+	req = req.WithContext(context.WithValue(req.Context(), heldConnKey{}, held))
 
 	// Try HTTP/2 first
 	resp, err := rt.http2tr.RoundTrip(req)
@@ -279,7 +285,14 @@ func (rt *roundtripper) dialTLSHTTP2(ctx context.Context, network, addr string) 
 
 	negotiatedProtocol := uconn.ConnectionState().NegotiatedProtocol
 	if negotiatedProtocol != "h2" {
-		uconn.Close()
+		// Chrome speaks HTTP/1.1 on the connection the server picked it for. Keep the
+		// connection for the HTTP/1.1 fallback of this request (see dialTLSFallback).
+		if held, ok := ctx.Value(heldConnKey{}).(*heldConn); ok {
+			held.put(uconn)
+		} else {
+			uconn.Close()
+		}
+
 		return nil, fmt.Errorf("%w: negotiated ALPN %q, expected h2", errALPNNotH2, negotiatedProtocol)
 	}
 
@@ -290,6 +303,58 @@ func (rt *roundtripper) dialTLSHTTP2(ctx context.Context, network, addr string) 
 // Used for fallback when HTTP/2 connection fails.
 func (rt *roundtripper) dialTLSHTTP1(ctx context.Context, network, addr string) (net.Conn, error) {
 	return rt.tlsHandshake(ctx, network, addr, true)
+}
+
+// dialTLSFallback opens the connection for the HTTP/1.1 fallback. When the server picked
+// http/1.1 in ALPN, it returns that same connection: a second handshake would carry an
+// ALPN list without h2, which Chrome never sends after an ALPN answer, and Akamai denies
+// that hello. Otherwise (HTTP_1_1_REQUIRED) it dials with HTTP/1.1-only ALPN, as Chrome does.
+func (rt *roundtripper) dialTLSFallback(ctx context.Context, network, addr string) (net.Conn, error) {
+	if held, ok := ctx.Value(heldConnKey{}).(*heldConn); ok {
+		if conn := held.take(); conn != nil {
+			return conn, nil
+		}
+	}
+
+	return rt.dialTLSHTTP1(ctx, network, addr)
+}
+
+// heldConnKey is the request context key for the heldConn of one request.
+type heldConnKey struct{}
+
+// heldConn carries the connection that ALPN gave http/1.1 from the HTTP/2 dial of a request
+// to its HTTP/1.1 fallback. It is per request, so concurrent requests never share it.
+type heldConn struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (h *heldConn) put(conn net.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.conn != nil {
+		h.conn.Close()
+	}
+
+	h.conn = conn
+}
+
+func (h *heldConn) take() net.Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	conn := h.conn
+	h.conn = nil
+
+	return conn
+}
+
+// close closes a held connection that the fallback did not use (it reused an idle one).
+func (h *heldConn) close() {
+	if conn := h.take(); conn != nil {
+		conn.Close()
+	}
 }
 
 // tlsHandshake performs a full TLS handshake using uTLS, applying JA fingerprint
